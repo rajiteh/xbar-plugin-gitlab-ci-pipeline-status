@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/homebrew/bin/python3
 # -*- coding: utf-8 -*-
 
 # <xbar.title>Gitlab CI Pipeline Status</xbar.title>
@@ -17,7 +17,7 @@ import requests
 from datetime import datetime
 import subprocess
 from shlex import quote
-from typing import Any
+from typing import Any, Union, Tuple
 
 # Dependency management function
 def install(pkg: str, spec: str = "", cache_dir: Path | str = "~/.cache"):
@@ -46,8 +46,51 @@ logging.basicConfig(level=logging.INFO, format="=====> %(message)s")
 from dataclasses import dataclass, field
 
 @dataclass
+class WatchConfig(dict):
+    def __init__(self, *args, **kwargs):
+        dict.__init__(self, *args, **kwargs)
+
+    @property
+    def notify(self) -> bool:
+        return self.get("notify", False)
+    
+    @notify.setter
+    def notify(self, value: bool):
+        self["notify"] = value
+
+    @property
+    def last_notified_at(self) -> Union[Tuple[datetime, str], None]:
+        value = self.get("last_notified_at")
+        if value:
+            timestamp, state = value.split("|")
+            return datetime.strptime(timestamp, '%H:%M:%S'), state
+        return None
+    
+    @last_notified_at.setter
+    def last_notified_at(self, value: Tuple[datetime, str]):
+        timestamp, state = value
+        self["last_notified_at"] = f"{timestamp.strftime('%H:%M:%S')}|{state}"
+
+    def send_notification(self, title, state: str):
+        if self.last_notified_at: # Make sure we have a last notified time
+            _, last_state = self.last_notified_at
+            if last_state != state:
+                display_notification(title, f"Pipeline state changed from '{last_state}' to '{state}'")
+            
+        self.last_notified_at = (datetime.now(), state)
+
+    @property
+    def show_jobs(self) -> bool:
+        return self.get("show_jobs", False)
+    
+    @show_jobs.setter
+    def show_jobs(self, value: bool):
+        self["show_jobs"] = value
+
+@dataclass
 class PluginConfig(Config):
-    URLS_TO_WATCH: list[str] = field(default_factory=list, repr=False)
+    URLS_TO_WATCH: dict[str,WatchConfig] = field(default_factory=dict, repr=False)
+    NOTIFY_DEFAULT: bool = True
     GITLAB_API_URL: str = ""
     GITLAB_TOKEN: str = ""
     GITLAB_TOKEN_MODE: str = "config"
@@ -55,24 +98,25 @@ class PluginConfig(Config):
     GITLAB_TOKEN_KEYCHAIN: str = "gitlab-ci-token"
     GITLAB_TOKEN_ONEPASSWORD: str = "op://vault/secret/field"
     _cached_gitlab_token: str = ""
+
     def add_url(self, url: str):
         url = url.strip().split("#")[0].split("?")[0]
         if not url.startswith("http"):
             raise ValueError(f"Invalid URL: {url}")
-        self.URLS_TO_WATCH.append(url)
+        if url in self.URLS_TO_WATCH.keys():
+            return
+        
+        self.URLS_TO_WATCH[url] = WatchConfig(notify=self.NOTIFY_DEFAULT, show_jobs=False)
         self.save()
 
     def remove_url(self, url: str):
-        self.URLS_TO_WATCH.remove(url)
-        self.save()
+        if url in self.URLS_TO_WATCH.keys():
+            del self.URLS_TO_WATCH[url]
+            self.save()
 
     def remove_all(self):
-        self.URLS_TO_WATCH = []
+        self.URLS_TO_WATCH = {}
         self.save()
-
-    def save(self):
-        self.URLS_TO_WATCH = list(set(self.URLS_TO_WATCH))
-        super().save()
 
     def as_config_dict(self) -> dict[str, Any]:
         sanitize = lambda x: x if isinstance(x, (str, int, float, bool, list, tuple, dict)) else str(x)
@@ -99,8 +143,17 @@ class PluginConfig(Config):
 
         self._cached_gitlab_token = token
         return token
-        
 
+    def get_watch_config(self, url) -> WatchConfig:
+        return WatchConfig(**self.URLS_TO_WATCH[url])
+    
+    def set_watch_config(self, url, config):
+        self.URLS_TO_WATCH[url] = config
+        self.save()
+
+    @property
+    def urls(self) -> dict[str,WatchConfig]:
+        return {url: WatchConfig(**config) for url, config in self.URLS_TO_WATCH.items()}
 
 # GitLab CI Pipeline Status Checker
 class GitLabCIChecker:
@@ -171,6 +224,22 @@ class GitLabCIChecker:
 
             return latest_pipeline
 
+    def get_jobs(self) -> dict[str, list]:
+        endpoint = f"{self.gitlab_host}/api/v4/projects/{self.project_id}/pipelines/{self.pipeline_id}/jobs"
+        response = requests.get(endpoint, headers=self.headers)
+        response.raise_for_status()
+        jobs = response.json()
+        # group by stage
+        stages = {}
+        for job in jobs:
+            stage = job['stage']
+            if stage not in stages:
+                stages[stage] = []
+            stages[stage].append(job)
+        # reverse the keys in stages
+        stages = dict(reversed(list(stages.items())))
+        return stages
+    
     def retry_pipeline(self):
         endpoint = f"{self.gitlab_host}/api/v4/projects/{self.project_id}/pipelines/{self.pipeline_id}/retry"
         response = requests.post(endpoint, headers=self.headers)
@@ -191,24 +260,50 @@ ICONS = {
     "pending": "⏳",
     "skipped": "⏭️",
     "canceled": "🚫",
+    "manual": "🤖",
 }
 
 # Menu item class for displaying pipeline status
 class GitlabStatus(MenuItem):
-    def __init__(self, url, gitlab_api, gitlab_token):
+    def __init__(self, url, watch_config: WatchConfig, gitlab_api, gitlab_token):
         self.checker = GitLabCIChecker(gitlab_api, gitlab_token, url)
         status_icon = ICONS.get(self.checker.status, "")
-        super().__init__(title=f"{status_icon} ({self.checker.status.upper()}) {self.checker.project_slug} {self.checker.ref_type}#{self.checker.ref}", href=self.checker.url)
-        self.with_submenu(ScriptCommand("🗑️ Clear", "remove_url", self.checker.url))
+        title = f"{status_icon} ({self.checker.status.upper()}) {self.checker.project_slug} {self.checker.ref_type}#{self.checker.ref}"
+        super().__init__(title=title, href=self.checker.url)
+        if watch_config.show_jobs:
+            jobs = self.checker.get_jobs()
+            for stage, jobs in jobs.items():
+                stage_menu = MenuItem(stage)
+                for job in jobs:
+                    job_icon = ICONS.get(job['status'], "")
+                    job_title = f"{job_icon} {job['name']}"
+                    stage_menu.with_submenu(MenuItem(job_title, href=job['web_url']))
+                self.with_submenu(stage_menu)
+            self.with_submenu(Divider())
+            self.with_submenu(ScriptCommand("🙈 Hide Jobs", "hide_jobs", self.checker.url))
+        else:
+            self.with_submenu(ScriptCommand("🫣 Show Jobs", "show_jobs", self.checker.url))
+        if watch_config.notify:
+            self.with_submenu(ScriptCommand("🔕 Disable Notifications", "disable_notify", self.checker.url))
+        else:
+            self.with_submenu(ScriptCommand("🔔 Enable Notifications", "enable_notify", self.checker.url))
         if self.checker.status == "failed":
             self.with_submenu(ScriptCommand("🔁 Retry", "retry_pipeline", self.checker.url))
-
+        self.with_submenu(ScriptCommand("🗑️ Clear", "remove_url", self.checker.url))
+    
 # Main function to generate xbar menu
 def xbar_menu(config: PluginConfig):
     try:
-        jobs = [GitlabStatus(url, config.GITLAB_API_URL, config.get_gitlab_token()) for url in config.URLS_TO_WATCH]
+        jobs = []
+        for url, watch_config in config.urls.items():
+            job = GitlabStatus(url, watch_config, config.GITLAB_API_URL, config.get_gitlab_token())
+            if watch_config.notify:
+                watch_config.send_notification(job.title, job.checker.status)
+                config.set_watch_config(url, watch_config)
+            jobs.append(job)
     except Exception as e:
         Menu(f"🚦❔").with_items(MenuItem(f"🚫 {str(e)}")).print()
+        logger.error(e, exc_info=True)
         return
     
     statistics = {status: len([job for job in jobs if job.checker.status == status]) for status in ICONS.keys()}
@@ -235,32 +330,58 @@ end tell'''
 def display_message(msg):
     subprocess.run(['osascript', '-e', f'display dialog "{msg}" buttons {{"OK"}}'])
 
+def display_notification(title, msg):
+    logger.info(f"Displaying notification: {title} - {msg}")
+    subprocess.run(['osascript', '-e', f'display notification "{msg}" with title "{title}" sound name "Blow"'])
+    
 if __name__ == "__main__":
 
     config = PluginConfig.get_config()
+    
     if len(sys.argv) < 2:
         xbar_menu(config)
-    elif sys.argv[1] == "add_url":
+        sys.exit(0)
+    
+    cmd = sys.argv[1]
+    if cmd == "add_url":
         result = prompt_user("Enter the GitLab URL")
         try:
             config.add_url(result)
         except Exception as e:
             display_message(str(e))
-    elif sys.argv[1] == "remove_url":
-        config.remove_url(sys.argv[2])
-    elif sys.argv[1] == "remove_all":
+
+    url = sys.argv[2]
+    if cmd == "remove_url":
+        config.remove_url(url)
+    elif cmd == "remove_all":
         config.remove_all()
-    elif sys.argv[1] == "remove_success":
-        urls = [url for url in config.URLS_TO_WATCH if GitLabCIChecker(config.GITLAB_API_URL, config.get_gitlab_token(), url).status == "success"]
+    elif cmd == "remove_success":
+        urls = [url for url in config.urls if GitLabCIChecker(config.GITLAB_API_URL, config.get_gitlab_token(), url).status == "success"]
         for url in urls:
             config.remove_url(url)
-    elif sys.argv[1] == "retry_pipeline":
+    elif cmd == "retry_pipeline":
         try:
-            checker = GitLabCIChecker(config.GITLAB_API_URL, config.get_gitlab_token(), sys.argv[2])
+            checker = GitLabCIChecker(config.GITLAB_API_URL, config.get_gitlab_token(), url)
             checker.retry_pipeline()
         except Exception as e:
             display_message(str(e))
             sys.exit(1)
+    elif cmd == "enable_notify":
+        watch_config = config.get_watch_config(url)
+        watch_config.notify = True
+        config.set_watch_config(url, watch_config)
+    elif cmd == "disable_notify":
+        watch_config = config.get_watch_config(url)
+        watch_config.notify = False
+        config.set_watch_config(url, watch_config)
+    elif cmd == "show_jobs":
+        watch_config = config.get_watch_config(url)
+        watch_config.show_jobs = True
+        config.set_watch_config(url, watch_config)
+    elif cmd == "hide_jobs":
+        watch_config = config.get_watch_config(url)
+        watch_config.show_jobs = False
+        config.set_watch_config(url, watch_config)
     else:
-        display_message(f"Unknown command: {sys.argv[1]}")
+        display_message(f"Unknown command: {cmd}")
         sys.exit(1)
